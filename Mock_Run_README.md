@@ -1,4 +1,4 @@
-# OpenRouter Run Guide
+# Mock Run Guide
 
 当前代码已经支持优先使用 OpenRouter。
 
