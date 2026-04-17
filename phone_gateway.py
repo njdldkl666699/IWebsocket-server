@@ -17,11 +17,15 @@ class DeviceGatewayError(RuntimeError):
     pass
 
 
+class ProtocolViolation(DeviceGatewayError):
+    pass
+
+
 class MessageEnvelope(BaseModel):
     type: Literal["request", "response"]
     message: str
     data: Any = None
-    requestId: int | None = None
+    requestId: int | None = Field(default=None, ge=1)
 
 
 class ConnectData(BaseModel):
@@ -133,9 +137,7 @@ class ConnectedDeviceSession:
             raise DeviceGatewayError(error.message)
 
         if response.message != "actionResult":
-            raise DeviceGatewayError(
-                f"Expected 'actionResult', got {response.message!r}."
-            )
+            raise DeviceGatewayError(f"Expected 'actionResult', got {response.message!r}.")
 
         action_result = ActionResultData.model_validate(response.data)
         self._update_device_info(
@@ -149,11 +151,16 @@ class ConnectedDeviceSession:
     async def _reader_loop(self) -> None:
         try:
             async for raw in self.websocket:
-                envelope = self._parse(raw)
-                if envelope.type == "request":
-                    await self._handle_client_request(envelope)
-                elif self._pending_response is not None and not self._pending_response.done():
-                    self._pending_response.set_result(envelope)
+                try:
+                    envelope = self._parse(raw)
+                    if envelope.type == "request":
+                        await self._handle_client_request(envelope)
+                    else:
+                        self._handle_client_response(envelope)
+                except ProtocolViolation as exc:
+                    print(f"[server] protocol violation from device={self.device_id}: {exc}")
+                    await self.websocket.close(code=1008, reason=str(exc))
+                    break
         except ConnectionClosed:
             pass
         finally:
@@ -164,28 +171,18 @@ class ConnectedDeviceSession:
                 )
 
     async def _handle_client_request(self, envelope: MessageEnvelope) -> None:
-        if envelope.message == "connect":
-            connect_data = ConnectData.model_validate(envelope.data)
-            self.device_info = DeviceInfo(
-                device_id=self.device_id,
-                width=connect_data.width,
-                height=connect_data.height,
-                token=connect_data.token,
-                screenshot=connect_data.screenshot,
-                ui=connect_data.ui,
-                current_package=connect_data.currentPackage,
-                activity=connect_data.activity,
-            )
-            self._next_request_id = (envelope.requestId or 0) + 1
-            self.ready.set()
-            print(
-                f"[server] device connected: deviceId={self.device_id} "
-                f"size={connect_data.width}x{connect_data.height} "
-                f"requestIdStart={self._next_request_id}"
-            )
+        if not self.ready.is_set():
+            if envelope.message != "connect":
+                raise ProtocolViolation("The first client request must be 'connect'.")
+            await self._handle_connect(envelope)
             return
 
+        if envelope.message == "connect":
+            raise ProtocolViolation("Duplicate 'connect' is not allowed on one websocket session.")
+
         if envelope.message == "ping":
+            if envelope.requestId is not None:
+                raise ProtocolViolation("'ping' must not carry requestId.")
             if VERBOSE_HEARTBEAT:
                 print(f"[server] <- heartbeat from device={self.device_id}")
             response = MessageEnvelope(type="response", message="pong", data=None)
@@ -199,6 +196,41 @@ class ConnectedDeviceSession:
             requestId=envelope.requestId,
         )
         await self.websocket.send(response.model_dump_json(exclude_none=True) + "\n")
+
+    async def _handle_connect(self, envelope: MessageEnvelope) -> None:
+        if envelope.requestId is None:
+            raise ProtocolViolation("'connect' must carry requestId.")
+        connect_data = ConnectData.model_validate(envelope.data)
+        self.device_info = DeviceInfo(
+            device_id=self.device_id,
+            width=connect_data.width,
+            height=connect_data.height,
+            token=connect_data.token,
+            screenshot=connect_data.screenshot,
+            ui=connect_data.ui,
+            current_package=connect_data.currentPackage,
+            activity=connect_data.activity,
+        )
+        self._next_request_id = envelope.requestId + 1
+        self.ready.set()
+        print(
+            f"[server] device connected: deviceId={self.device_id} "
+            f"size={connect_data.width}x{connect_data.height} "
+            f"requestIdStart={self._next_request_id}"
+        )
+
+    def _handle_client_response(self, envelope: MessageEnvelope) -> None:
+        if not self.ready.is_set():
+            raise ProtocolViolation("Received response before 'connect' completed.")
+        if envelope.message == "pong":
+            raise ProtocolViolation("Client must not send 'pong'.")
+        if envelope.requestId is None:
+            raise ProtocolViolation("Business response must carry requestId.")
+        if self._pending_response is None or self._pending_response.done():
+            raise ProtocolViolation(
+                f"Received unexpected response {envelope.message!r} without a pending server request."
+            )
+        self._pending_response.set_result(envelope)
 
     def _consume_next_request_id(self) -> int:
         if self._next_request_id is None:
@@ -231,12 +263,15 @@ class ConnectedDeviceSession:
     def _parse(raw: str) -> MessageEnvelope:
         line = raw.strip()
         if not line:
-            raise DeviceGatewayError("Received empty JSONL message.")
+            raise ProtocolViolation("Received empty JSONL message.")
         try:
             payload = json.loads(line)
         except json.JSONDecodeError as exc:
-            raise DeviceGatewayError(f"Invalid JSON message: {exc}") from exc
-        return MessageEnvelope.model_validate(payload)
+            raise ProtocolViolation(f"Invalid JSON message: {exc}") from exc
+        try:
+            return MessageEnvelope.model_validate(payload)
+        except Exception as exc:  # pydantic validation errors
+            raise ProtocolViolation(f"Invalid envelope: {exc}") from exc
 
 
 class DeviceGateway:

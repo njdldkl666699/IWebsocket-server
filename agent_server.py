@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import ssl
 from contextlib import suppress
 from typing import Any
 
@@ -35,7 +36,11 @@ async def agent_console_loop(gateway: DeviceGateway, stop_event: asyncio.Event) 
             continue
 
         conversation_messages.append(build_observation_message(session, text))
-        result = await agent.ainvoke({"messages": conversation_messages})
+        try:
+            result = await agent.ainvoke({"messages": conversation_messages})
+        except Exception as exc:
+            print(f"[assistant] 模型调用失败：{_format_model_error(exc)}")
+            continue
         conversation_messages, final_message = _consume_agent_result(conversation_messages, result)
         if final_message:
             print(f"[assistant] {final_message}")
@@ -47,7 +52,13 @@ def _consume_agent_result(
 ) -> tuple[list[dict[str, Any]], str | None]:
     if isinstance(result, dict) and "messages" in result:
         messages = list(result["messages"])
-        return messages, _extract_last_text(messages)
+        final_text = _extract_last_text(messages)
+        if final_text:
+            return messages, final_text
+        # Some providers reject follow-up turns if the previous turn ended with an
+        # incomplete tool-call exchange and no assistant-facing text. In that case,
+        # keep the prior stable conversation state and only surface a fallback note.
+        return conversation_messages, _fallback_result_text(messages)
 
     if isinstance(result, str):
         return conversation_messages, result
@@ -83,12 +94,47 @@ def _get_field(message: object, field: str) -> object:
     return getattr(message, field, None)
 
 
-async def run_server(host: str, port: int) -> None:
+def _fallback_result_text(messages: list[object]) -> str:
+    if not messages:
+        return "这一轮没有返回任何消息。"
+
+    last_message = messages[-1]
+    message_type = _get_field(last_message, "type")
+    role = _get_field(last_message, "role")
+
+    if message_type == "tool" or role == "tool":
+        tool_name = _get_field(last_message, "name") or "unknown_tool"
+        return f"这一轮执行到了工具 `{tool_name}`，但没有生成可显示的自然语言回复。"
+
+    return "这一轮没有生成可显示的自然语言回复，可能是模型空回复，或返回内容格式暂未被控制台识别。"
+
+
+def _format_model_error(exc: Exception) -> str:
+    text = str(exc).strip()
+    if text:
+        return text
+    return f"{type(exc).__name__}"
+
+
+def _build_ssl_context(certfile: str | None, keyfile: str | None) -> ssl.SSLContext | None:
+    if not certfile and not keyfile:
+        return None
+    if not certfile or not keyfile:
+        raise ValueError("Both --certfile and --keyfile are required to enable TLS.")
+
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    context.load_cert_chain(certfile=certfile, keyfile=keyfile)
+    return context
+
+
+async def run_server(host: str, port: int, certfile: str | None, keyfile: str | None) -> None:
     gateway = DeviceGateway()
     stop_event = asyncio.Event()
+    ssl_context = _build_ssl_context(certfile, keyfile)
+    scheme = "wss" if ssl_context else "ws"
 
-    async with serve(gateway.handler, host, port):
-        print(f"[system] websocket server listening at ws://{host}:{port}/ws/devices/{{deviceId}}")
+    async with serve(gateway.handler, host, port, ssl=ssl_context):
+        print(f"[system] websocket server listening at {scheme}://{host}:{port}/ws/devices/{{deviceId}}")
         print("[system] waiting for mobile client connections...")
         input_task = asyncio.create_task(agent_console_loop(gateway, stop_event))
 
@@ -106,13 +152,15 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Deep Agent websocket server for mobile control")
     parser.add_argument("--host", default="0.0.0.0", help="Listen host")
     parser.add_argument("--port", type=int, default=8765, help="Listen port")
+    parser.add_argument("--certfile", default=None, help="TLS certificate path for wss")
+    parser.add_argument("--keyfile", default=None, help="TLS private key path for wss")
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
     try:
-        asyncio.run(run_server(args.host, args.port))
+        asyncio.run(run_server(args.host, args.port, args.certfile, args.keyfile))
     except KeyboardInterrupt:
         print("\n[system] server exited")
 

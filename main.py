@@ -1,6 +1,9 @@
+from __future__ import annotations
+
 import argparse
 import asyncio
 import re
+import ssl
 from contextlib import suppress
 
 from websockets.asyncio.server import ServerConnection, serve
@@ -10,16 +13,26 @@ clients: set[ServerConnection] = set()
 PATH_PATTERN = re.compile(r"^/ws/devices/(?P<device_id>[^/]+)$")
 
 
+def _build_ssl_context(certfile: str | None, keyfile: str | None) -> ssl.SSLContext | None:
+    if not certfile and not keyfile:
+        return None
+    if not certfile or not keyfile:
+        raise ValueError("Both --certfile and --keyfile are required to enable TLS.")
+
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    context.load_cert_chain(certfile=certfile, keyfile=keyfile)
+    return context
+
+
 async def broadcast(message: str) -> None:
     if not clients:
-        print("[系统] 当前没有已连接客户端")
+        print("[system] 当前没有已连接客户端")
         return
 
-    disconnected = []
+    disconnected: list[ServerConnection] = []
     for ws in clients:
         try:
-            print("[广播] 发送消息给客户端:", message)
-            # 一定要加上换行符，否则客户端无法正确接收消息
+            print("[broadcast] sending to client:", message)
             await ws.send(message + "\n", text=True)
         except ConnectionClosed:
             disconnected.append(ws)
@@ -31,36 +44,35 @@ async def broadcast(message: str) -> None:
 async def handle_client(websocket: ServerConnection) -> None:
     request = websocket.request
     if request is None:
-        print("[拒绝] 无法获取连接请求信息")
+        print("[reject] missing websocket request metadata")
         await websocket.close(code=1008, reason="invalid request")
         return
 
     path = request.path
     match = PATH_PATTERN.match(path)
     if not match:
-        print(f"[拒绝] 非法连接路径: {path!r}")
+        print(f"[reject] invalid device path: {path!r}")
         await websocket.close(code=1008, reason="invalid path")
         return
 
     device_id = match.group("device_id")
     clients.add(websocket)
     peer = websocket.remote_address
-    print(f"[连接] 设备 {device_id} 已连接: {peer}")
+    print(f"[connect] device {device_id} connected: {peer}")
 
     try:
         async for message in websocket:
-            print(f"[客户端 {device_id}@{peer}] {message}")
-            # await broadcast(f"[来自设备 {device_id}] {message}")
+            print(f"[client {device_id}@{peer}] {message}")
     except ConnectionClosed:
         pass
     finally:
         clients.discard(websocket)
-        print(f"[断开] 设备 {device_id} 已断开: {peer}")
+        print(f"[disconnect] device {device_id} disconnected: {peer}")
 
 
 async def console_input_loop(stop_event: asyncio.Event) -> None:
-    print("[系统] 输入消息并回车可广播给所有客户端")
-    print("[系统] 输入 /quit 关闭服务")
+    print("[system] 输入一行 JSON envelope 并回车，可广播给所有客户端")
+    print("[system] 输入 /quit 关闭服务")
 
     while not stop_event.is_set():
         text = await asyncio.to_thread(input, "server> ")
@@ -75,17 +87,19 @@ async def console_input_loop(stop_event: asyncio.Event) -> None:
         await broadcast(text)
 
 
-async def run_server(host: str, port: int) -> None:
+async def run_server(host: str, port: int, certfile: str | None, keyfile: str | None) -> None:
     stop_event = asyncio.Event()
+    ssl_context = _build_ssl_context(certfile, keyfile)
+    scheme = "wss" if ssl_context else "ws"
 
-    async with serve(handle_client, host, port):
-        print(f"[系统] WebSocket 服务已启动 ws://{host}:{port}/ws/device/{{deviceId}}")
+    async with serve(handle_client, host, port, ssl=ssl_context):
+        print(f"[system] websocket server listening at {scheme}://{host}:{port}/ws/devices/{{deviceId}}")
         input_task = asyncio.create_task(console_input_loop(stop_event))
 
         try:
             await stop_event.wait()
         except KeyboardInterrupt:
-            print("\n[系统] 收到 Ctrl+C，正在关闭服务...")
+            print("\n[system] received Ctrl+C, shutting down...")
         finally:
             input_task.cancel()
             with suppress(asyncio.CancelledError):
@@ -93,18 +107,20 @@ async def run_server(host: str, port: int) -> None:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="交互型 WebSocket 服务端")
-    parser.add_argument("--host", default="0.0.0.0", help="监听地址")
-    parser.add_argument("--port", type=int, default=8765, help="监听端口")
+    parser = argparse.ArgumentParser(description="Manual websocket JSON console server")
+    parser.add_argument("--host", default="0.0.0.0", help="Listen host")
+    parser.add_argument("--port", type=int, default=8765, help="Listen port")
+    parser.add_argument("--certfile", default=None, help="TLS certificate path for wss")
+    parser.add_argument("--keyfile", default=None, help="TLS private key path for wss")
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
     try:
-        asyncio.run(run_server(args.host, args.port))
+        asyncio.run(run_server(args.host, args.port, args.certfile, args.keyfile))
     except KeyboardInterrupt:
-        print("\n[系统] 服务已退出")
+        print("\n[system] server exited")
 
 
 if __name__ == "__main__":
