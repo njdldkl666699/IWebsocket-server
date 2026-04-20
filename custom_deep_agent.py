@@ -44,12 +44,16 @@ def _is_image_block(block: Any) -> bool:
         return False
 
     block_type = block.get("type")
-    return block_type in {
-        "image",
-        "image_url",
-        "input_image",
-        "image_base64",
-    } or "image_url" in block
+    return (
+        block_type
+        in {
+            "image",
+            "image_url",
+            "input_image",
+            "image_base64",
+        }
+        or "image_url" in block
+    )
 
 
 def _find_latest_image_position(messages: list[Any]) -> tuple[int, int] | None:
@@ -132,15 +136,16 @@ def build_agent(gateway: DeviceGateway):
 
 
 def _build_model():
-    openrouter_key = os.getenv("OPENROUTER_API_KEY")
-    openrouter_model = os.getenv("OPENROUTER_MODEL", "openai/gpt-5.1")
-    openrouter_max_tokens = int(os.getenv("OPENROUTER_MAX_TOKENS", "4096"))
-    if openrouter_key:
+    openai_key = os.getenv("OPENAI_API_KEY")
+    openai_model = os.getenv("OPENAI_MODEL", "gpt-5-mini")
+    openai_max_tokens = int(os.getenv("OPENAI_MAX_TOKENS", "4096"))
+    openai_base_url = os.getenv("OPENAI_BASE_URL")
+    if openai_key:
         return ChatOpenAI(
-            api_key=openrouter_key,
-            base_url="https://openrouter.ai/api/v1",
-            model=openrouter_model,
-            max_tokens=openrouter_max_tokens,
+            api_key=openai_key,
+            base_url=openai_base_url,
+            model=openai_model,
+            max_tokens=openai_max_tokens,
         )
 
     return "openai:gpt-5.4"
