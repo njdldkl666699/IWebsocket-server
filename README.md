@@ -20,7 +20,7 @@ pip install -e .
 ## 启动服务
 
 ```bash
-python main.py --host 127.0.0.1 --port 8765
+python -m entrypoints.main --host 127.0.0.1 --port 8765
 ```
 
 连接地址格式：`ws://127.0.0.1:8765/ws/device/{deviceId}`
