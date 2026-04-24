@@ -1,5 +1,5 @@
 [project]
-name = "websocket"
+name = "IWebsocket"
 version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
@@ -8,6 +8,30 @@ dependencies = [
     "deepagents>=0.5.2",
     "langchain-core>=0.3",
     "langchain-openai>=1.1.14",
+    "loguru>=0.7.3",
     "pydantic>=2.11,<3",
+    "python-dotenv>=1.2.2",
     "websockets>=12.0",
+]
+
+[project.optional-dependencies]
+dev = ["mypy>=1.11.1", "ruff>=0.6.1"]
+
+[build-system]
+requires = ["setuptools>=73.0.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["entrypoints*", "mobile_agent*"]
+
+[tool.setuptools.package-data]
+"*" = ["py.typed"]
+
+[dependency-groups]
+dev = [
+    "anyio>=4.7.0",
+    "langgraph-cli[inmem]>=0.4.14",
+    "mypy>=1.13.0",
+    "pytest>=8.3.5",
+    "ruff>=0.8.2",
 ]

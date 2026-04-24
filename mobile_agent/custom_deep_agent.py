@@ -1,14 +1,17 @@
 from __future__ import annotations
 
 import os
-from typing import Any
+from collections.abc import Sequence
+from typing import TypeAlias, cast
 
 from deepagents import create_deep_agent
 from langchain.agents.middleware.types import AgentState, StateT, before_model
-from langchain_core.messages import RemoveMessage
+from langchain_core.messages import BaseMessage, HumanMessage, RemoveMessage
 from langchain_openai import ChatOpenAI
 from langgraph.graph.message import REMOVE_ALL_MESSAGES
 from langgraph.runtime import Runtime
+from dotenv import load_dotenv
+from pydantic import SecretStr
 
 from .phone_gateway import ConnectedDeviceSession, DeviceGateway
 from .phone_tools import create_phone_tools
@@ -16,32 +19,40 @@ from .prompt_assets import SYSTEM_PROMPT, TOOL_PROMPT
 
 STATE_MESSAGE_PREFIX = "[PHONE_STATE]"
 
+MessagePayload: TypeAlias = dict[str, object]
+MessageBlock: TypeAlias = MessagePayload | str
+MessageContent: TypeAlias = str | list[MessageBlock] | None
+AgentMessage: TypeAlias = BaseMessage | MessagePayload
+AgentMessages: TypeAlias = list[AgentMessage]
+MiddlewarePatch: TypeAlias = dict[str, list[RemoveMessage | AgentMessage]]
 
-def _message_content(message: Any) -> Any:
+
+def _message_content(message: AgentMessage) -> MessageContent:
     if isinstance(message, dict):
-        return message.get("content")
-    return getattr(message, "content", None)
+        content = message.get("content")
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            return cast(list[MessageBlock], content)
+        return None
+    if isinstance(message, BaseMessage):
+        return message.content
+    return None
 
 
-def _set_message_content(message: Any, content: Any) -> Any:
+def _set_message_content(message: AgentMessage, content: MessageContent) -> AgentMessage:
     if isinstance(message, dict):
         new_message = dict(message)
         new_message["content"] = content
         return new_message
 
-    model_copy = getattr(message, "model_copy", None)
-    if callable(model_copy):
-        return model_copy(update={"content": content})
-
-    if hasattr(message, "copy"):
-        new_message = message.copy()
-        new_message.content = content
-        return new_message
+    if isinstance(message, BaseMessage):
+        return message.model_copy(update={"content": content})
 
     raise TypeError(f"Unsupported message type: {type(message)!r}")
 
 
-def _is_image_block(block: Any) -> bool:
+def _is_image_block(block: MessageBlock) -> bool:
     if not isinstance(block, dict):
         return False
 
@@ -58,7 +69,7 @@ def _is_image_block(block: Any) -> bool:
     )
 
 
-def _find_latest_image_position(messages: list[Any]) -> tuple[int, int] | None:
+def _find_latest_image_position(messages: Sequence[AgentMessage]) -> tuple[int, int] | None:
     for message_index in range(len(messages) - 1, -1, -1):
         content = _message_content(messages[message_index])
         if not isinstance(content, list):
@@ -70,13 +81,13 @@ def _find_latest_image_position(messages: list[Any]) -> tuple[int, int] | None:
     return None
 
 
-def _remove_old_images_from_messages(messages: list[Any]) -> list[Any]:
+def _remove_old_images_from_messages(messages: Sequence[AgentMessage]) -> AgentMessages:
     latest_image_position = _find_latest_image_position(messages)
     if latest_image_position is None:
-        return messages
+        return list(messages)
 
     latest_message_index, latest_block_index = latest_image_position
-    filtered_messages: list[Any] = []
+    filtered_messages: AgentMessages = []
 
     for message_index, message in enumerate(messages):
         content = _message_content(message)
@@ -84,7 +95,7 @@ def _remove_old_images_from_messages(messages: list[Any]) -> list[Any]:
             filtered_messages.append(message)
             continue
 
-        new_content: list[Any] = []
+        new_content: list[MessageBlock] = []
         for block_index, block in enumerate(content):
             if not _is_image_block(block):
                 new_content.append(block)
@@ -106,23 +117,27 @@ def _remove_old_images_from_messages(messages: list[Any]) -> list[Any]:
     return filtered_messages
 
 
-def _is_phone_state_message(message: Any) -> bool:
+def _is_phone_state_message(message: AgentMessage) -> bool:
     content = _message_content(message)
     if not isinstance(content, list) or not content:
         return False
 
     first = content[0]
+    if not isinstance(first, dict):
+        return False
+
+    first_type = first.get("type")
+    first_text = first.get("text")
     return (
-        isinstance(first, dict)
-        and first.get("type") == "text"
-        and isinstance(first.get("text"), str)
-        and first["text"].startswith(STATE_MESSAGE_PREFIX)
+        first_type == "text"
+        and isinstance(first_text, str)
+        and first_text.startswith(STATE_MESSAGE_PREFIX)
     )
 
 
 def _replace_phone_state_message(
-    messages: list[Any], session: ConnectedDeviceSession
-) -> list[Any]:
+    messages: Sequence[AgentMessage], session: ConnectedDeviceSession
+) -> AgentMessages:
     filtered_messages = [m for m in messages if not _is_phone_state_message(m)]
     filtered_messages.append(build_state_snapshot_message(session))
     return filtered_messages
@@ -132,11 +147,9 @@ def _replace_phone_state_message(
 def remove_old_images(
     state: AgentState[StateT],
     runtime: Runtime,
-) -> dict[str, Any] | None:
+) -> MiddlewarePatch | None:
     messages = list(state["messages"])
     filtered_messages = _remove_old_images_from_messages(messages)
-    # 对message进行处理，移除其中的旧图片，只保留最新一张
-    # 这里写个假业务逻辑，实际中你需要根据message的结构来实现这个功能
 
     if filtered_messages == messages:
         return None
@@ -154,9 +167,9 @@ def make_sync_phone_state_middleware(gateway: DeviceGateway):
     def sync_phone_state(
         state: AgentState[StateT],
         runtime: Runtime,
-    ) -> dict[str, Any] | None:
+    ) -> MiddlewarePatch | None:
         try:
-            session = gateway.get_default_device()
+            session = gateway.get_session()
         except Exception:
             return None
 
@@ -186,13 +199,14 @@ def build_agent(gateway: DeviceGateway):
 
 
 def _build_model():
+    load_dotenv()
     openai_key = os.getenv("OPENAI_API_KEY")
     openai_model = os.getenv("OPENAI_MODEL", "gpt-5-mini")
     openai_max_tokens = int(os.getenv("OPENAI_MAX_TOKENS", "4096"))
-    openai_base_url = os.getenv("OPENAI_BASE_URL")
+    openai_base_url = os.getenv("OPENAI_BASE_URL") or None
     if openai_key:
         return ChatOpenAI(
-            api_key=openai_key,
+            api_key=SecretStr(openai_key),
             base_url=openai_base_url,
             model=openai_model,
             max_tokens=openai_max_tokens,
@@ -201,15 +215,15 @@ def _build_model():
     return "openai:gpt-5.4"
 
 
-def build_user_message(user_text: str) -> dict[str, Any]:
-    return {"role": "user", "content": user_text}
+def build_user_message(user_text: str) -> HumanMessage:
+    return HumanMessage(content=user_text)
 
 
-def build_state_snapshot_message(session: ConnectedDeviceSession) -> dict[str, Any]:
+def build_state_snapshot_message(session: ConnectedDeviceSession) -> HumanMessage:
     if session.device_info is None:
         raise RuntimeError("Device session has no device_info yet.")
 
-    content: list[dict[str, Any]] = [
+    content: list[str | dict[str, object]] = [
         {
             "type": "text",
             "text": (
@@ -233,4 +247,4 @@ def build_state_snapshot_message(session: ConnectedDeviceSession) -> dict[str, A
             }
         )
 
-    return {"role": "user", "content": content}
+    return HumanMessage(content=content)

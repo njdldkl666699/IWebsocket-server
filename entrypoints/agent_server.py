@@ -4,8 +4,10 @@ import argparse
 import asyncio
 import ssl
 from contextlib import suppress
-from typing import Any
+from typing import Any, TypeAlias, cast
 
+from langchain_core.messages import BaseMessage
+from loguru import logger
 from websockets.asyncio.server import serve
 
 from mobile_agent.custom_deep_agent import (
@@ -13,14 +15,21 @@ from mobile_agent.custom_deep_agent import (
     build_state_snapshot_message,
     build_user_message,
 )
-from mobile_agent.phone_gateway import DeviceGateway, DeviceGatewayError
+from mobile_agent.phone_gateway import ConnectedDeviceSession, DeviceGateway, DeviceGatewayError
+
+MessagePayload: TypeAlias = dict[str, Any]
+MessageBlock: TypeAlias = MessagePayload | str
+MessageContent: TypeAlias = str | list[MessageBlock] | None
+AgentMessage: TypeAlias = BaseMessage | MessagePayload
+AgentMessages: TypeAlias = list[AgentMessage]
+InvokeResult: TypeAlias = dict[str, AgentMessages] | str | None
 
 
 async def agent_console_loop(gateway: DeviceGateway, stop_event: asyncio.Event) -> None:
-    print("[system] 输入自然语言任务并回车，Agent 会通过 websocket tools 操作已连接手机")
-    print("[system] 输入 /quit 关闭服务")
+    logger.info("输入自然语言任务并回车，Agent 会通过 websocket tools 操作已连接手机")
+    logger.info("输入 /quit 关闭服务")
 
-    conversation_messages: list[dict[str, Any]] = []
+    conversation_messages: AgentMessages = []
     agent = build_agent(gateway)
 
     while not stop_event.is_set():
@@ -34,25 +43,27 @@ async def agent_console_loop(gateway: DeviceGateway, stop_event: asyncio.Event) 
             break
 
         try:
-            session = gateway.get_default_device()
+            session = gateway.get_session()
         except DeviceGatewayError as exc:
-            print(f"[system] {exc}")
+            logger.warning(str(exc))
             continue
 
         await _ensure_initial_observation(session)
         conversation_messages.append(build_user_message(text))
         conversation_messages.append(build_state_snapshot_message(session))
         try:
-            result = await agent.ainvoke({"messages": conversation_messages})
+            result = cast(
+                InvokeResult, await agent.ainvoke(cast(Any, {"messages": conversation_messages}))
+            )
         except Exception as exc:
-            print(f"[assistant] 模型调用失败：{_format_model_error(exc)}")
+            logger.error(f"模型调用失败：{_format_model_error(exc)}")
             continue
         conversation_messages, final_message = _consume_agent_result(conversation_messages, result)
         if final_message:
-            print(f"[assistant] {final_message}")
+            logger.info(final_message)
 
 
-async def _ensure_initial_observation(session) -> None:
+async def _ensure_initial_observation(session: ConnectedDeviceSession) -> None:
     device_info = session.device_info
     if device_info is None:
         return
@@ -62,17 +73,17 @@ async def _ensure_initial_observation(session) -> None:
 
     try:
         await session.send_command("observe", None)
-        print(f"[system] 首轮缺少截图，已为设备 {session.device_id} 自动补一次 observe")
+        logger.info("首轮缺少截图，已自动补一次 observe")
     except Exception as exc:
-        print(f"[system] 自动补 observe 失败：{exc}")
+        logger.warning(f"自动补 observe 失败：{exc}")
 
 
 def _consume_agent_result(
-    conversation_messages: list[dict[str, Any]],
-    result: object,
-) -> tuple[list[dict[str, Any]], str | None]:
+    conversation_messages: AgentMessages,
+    result: InvokeResult,
+) -> tuple[AgentMessages, str | None]:
     if isinstance(result, dict) and "messages" in result:
-        messages = list(result["messages"])
+        messages = result["messages"]
         final_text = _extract_last_text(messages)
         if final_text:
             return messages, final_text
@@ -87,14 +98,12 @@ def _consume_agent_result(
     return conversation_messages, str(result) if result is not None else None
 
 
-def _extract_last_text(messages: list[object]) -> str | None:
+def _extract_last_text(messages: AgentMessages) -> str | None:
     for message in reversed(messages):
-        role = _get_field(message, "role")
-        message_type = _get_field(message, "type")
+        role, message_type, content, _ = _split_message_fields(message)
         if role not in {"assistant", "tool"} and message_type not in {"ai", "tool"}:
             continue
 
-        content = _get_field(message, "content")
         if isinstance(content, str):
             return content
         if isinstance(content, list):
@@ -109,22 +118,46 @@ def _extract_last_text(messages: list[object]) -> str | None:
     return None
 
 
-def _get_field(message: object, field: str) -> object:
+def _split_message_fields(
+    message: AgentMessage,
+) -> tuple[str | None, str | None, MessageContent, str | None]:
     if isinstance(message, dict):
-        return message.get(field)
-    return getattr(message, field, None)
+        role = message.get("role")
+        message_type = message.get("type")
+        content = message.get("content")
+        name = message.get("name")
+        return (
+            role if isinstance(role, str) else None,
+            message_type if isinstance(message_type, str) else None,
+            cast(MessageContent, content),
+            name if isinstance(name, str) else None,
+        )
+
+    if isinstance(message, BaseMessage):
+        dumped = message.model_dump()
+        role = dumped.get("role")
+        message_type = dumped.get("type")
+        content = dumped.get("content")
+        name = dumped.get("name")
+        return (
+            role if isinstance(role, str) else None,
+            message_type if isinstance(message_type, str) else None,
+            cast(MessageContent, content),
+            name if isinstance(name, str) else None,
+        )
+
+    return None, None, None, None
 
 
-def _fallback_result_text(messages: list[object]) -> str:
+def _fallback_result_text(messages: AgentMessages) -> str:
     if not messages:
         return "这一轮没有返回任何消息。"
 
     last_message = messages[-1]
-    message_type = _get_field(last_message, "type")
-    role = _get_field(last_message, "role")
+    role, message_type, _, name = _split_message_fields(last_message)
 
     if message_type == "tool" or role == "tool":
-        tool_name = _get_field(last_message, "name") or "unknown_tool"
+        tool_name = name or "unknown_tool"
         return f"这一轮执行到了工具 `{tool_name}`，但没有生成可显示的自然语言回复。"
 
     return "这一轮没有生成可显示的自然语言回复，可能是模型空回复，或返回内容格式暂未被控制台识别。"
@@ -155,14 +188,14 @@ async def run_server(host: str, port: int, certfile: str | None, keyfile: str | 
     scheme = "wss" if ssl_context else "ws"
 
     async with serve(gateway.handler, host, port, ssl=ssl_context):
-        print(f"[system] websocket server listening at {scheme}://{host}:{port}/adb")
-        print("[system] waiting for mobile client connections...")
+        logger.info(f"websocket server listening at {scheme}://{host}:{port}/adb")
+        logger.info("waiting for mobile client connections...")
         input_task = asyncio.create_task(agent_console_loop(gateway, stop_event))
 
         try:
             await stop_event.wait()
         except KeyboardInterrupt:
-            print("\n[system] received Ctrl+C, shutting down...")
+            logger.warning("received Ctrl+C, shutting down...")
         finally:
             input_task.cancel()
             with suppress(asyncio.CancelledError):
@@ -183,7 +216,7 @@ def main() -> None:
     try:
         asyncio.run(run_server(args.host, args.port, args.certfile, args.keyfile))
     except KeyboardInterrupt:
-        print("\n[system] server exited")
+        logger.warning("server exited")
 
 
 if __name__ == "__main__":

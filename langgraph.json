@@ -1,0 +1,17 @@
+{
+  "$schema": "https://langgra.ph/schema.json",
+  "dependencies": [
+    "."
+  ],
+  "graphs": {
+    "agent": {
+      "path": "mobile_agent.graph:graph",
+      "description": "Android mobile deep-agent graph with websocket gateway lifecycle"
+    }
+  },
+  "http": {
+    "app": "mobile_agent.http_app:app"
+  },
+  "env": ".env",
+  "image_distro": "wolfi"
+}

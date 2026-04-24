@@ -4,8 +4,11 @@ import asyncio
 import json
 import os
 from dataclasses import dataclass
+from types import SimpleNamespace
 from typing import Any, Literal
 
+from loguru import logger
+from starlette.websockets import WebSocket, WebSocketDisconnect
 from pydantic import BaseModel, Field
 from websockets.asyncio.server import ServerConnection
 from websockets.exceptions import ConnectionClosed
@@ -55,7 +58,6 @@ class ErrorData(BaseModel):
 
 @dataclass
 class DeviceInfo:
-    device_id: str
     width: int
     height: int
     screenshot: str | None
@@ -66,9 +68,8 @@ class DeviceInfo:
 
 
 class ConnectedDeviceSession:
-    def __init__(self, websocket: ServerConnection, device_id: str) -> None:
+    def __init__(self, websocket: ServerConnection | "StarletteWebSocketConnection") -> None:
         self.websocket = websocket
-        self.device_id = device_id
         self.device_info: DeviceInfo | None = None
         self.ready = asyncio.Event()
         self.closed = asyncio.Event()
@@ -94,9 +95,9 @@ class ConnectedDeviceSession:
 
     async def send_command(self, message: str, data: Any, timeout: float = 20.0) -> dict[str, Any]:
         if self.closed.is_set():
-            raise DeviceGatewayError(f"Device {self.device_id} is disconnected.")
+            raise DeviceGatewayError("Device is disconnected.")
         if not self.ready.is_set():
-            raise DeviceGatewayError(f"Device {self.device_id} has not completed connect.")
+            raise DeviceGatewayError("Device has not completed connect.")
 
         loop = asyncio.get_running_loop()
         async with self._request_id_lock:
@@ -109,9 +110,9 @@ class ConnectedDeviceSession:
                 data=data,
                 requestId=request_id,
             )
-        print(
-            f"[server] -> device={self.device_id} requestId={request_id} "
-            f"message={payload.message} data={payload.data}"
+        logger.info(
+            f"-> requestId={request_id} message={payload.message} "
+            f"data={_sanitize_log_payload(payload.data)}"
         )
         async with self._send_lock:
             await self.websocket.send(payload.model_dump_json(exclude_none=True) + "\n")
@@ -120,9 +121,9 @@ class ConnectedDeviceSession:
         finally:
             self._pending_responses.pop(request_id, None)
 
-        print(
-            f"[server] <- device={self.device_id} requestId={response.requestId} "
-            f"message={response.message} data={response.data}"
+        logger.info(
+            f"<- requestId={response.requestId} message={response.message} "
+            f"data={_sanitize_log_payload(response.data)}"
         )
         if response.requestId != request_id:
             raise DeviceGatewayError(
@@ -142,7 +143,9 @@ class ConnectedDeviceSession:
         if response.message != "actionResult":
             raise DeviceGatewayError(f"Expected 'actionResult', got {response.message!r}.")
 
-        action_result = response.data if isinstance(response.data, dict) else {"value": response.data}
+        action_result = (
+            response.data if isinstance(response.data, dict) else {"value": response.data}
+        )
         self._update_device_info_from_payload(action_result)
         return action_result
 
@@ -156,7 +159,7 @@ class ConnectedDeviceSession:
                     else:
                         self._handle_client_response(envelope)
                 except ProtocolViolation as exc:
-                    print(f"[server] protocol violation from device={self.device_id}: {exc}")
+                    logger.warning(f"protocol violation: {exc}")
                     await self.websocket.close(code=1008, reason=str(exc))
                     break
         except ConnectionClosed:
@@ -165,9 +168,7 @@ class ConnectedDeviceSession:
             self.closed.set()
             for future in list(self._pending_responses.values()):
                 if not future.done():
-                    future.set_exception(
-                        DeviceGatewayError(f"Device {self.device_id} disconnected.")
-                    )
+                    future.set_exception(DeviceGatewayError("Device disconnected."))
             self._pending_responses.clear()
 
     async def _handle_client_request(self, envelope: MessageEnvelope) -> None:
@@ -184,7 +185,7 @@ class ConnectedDeviceSession:
             if envelope.requestId is not None:
                 raise ProtocolViolation("'ping' must not carry requestId.")
             if VERBOSE_HEARTBEAT:
-                print(f"[server] <- heartbeat from device={self.device_id}")
+                logger.debug("<- heartbeat")
             response = MessageEnvelope(type="response", message="pong", data=None)
             await self.websocket.send(response.model_dump_json(exclude_none=True) + "\n")
             return
@@ -202,7 +203,6 @@ class ConnectedDeviceSession:
             raise ProtocolViolation("'connect' must carry fixed requestId=1.")
         connect_data = ConnectData.model_validate(envelope.data)
         self.device_info = DeviceInfo(
-            device_id=self.device_id,
             width=connect_data.width,
             height=connect_data.height,
             screenshot=connect_data.screenshot,
@@ -213,9 +213,8 @@ class ConnectedDeviceSession:
         )
         self._next_request_id = 2
         self.ready.set()
-        print(
-            f"[server] device connected: deviceId={self.device_id} "
-            f"size={connect_data.width}x{connect_data.height} "
+        logger.info(
+            f"device connected: size={connect_data.width}x{connect_data.height} "
             f"requestIdStart={self._next_request_id}"
         )
 
@@ -235,9 +234,7 @@ class ConnectedDeviceSession:
 
     def _consume_next_request_id(self) -> int:
         if self._next_request_id is None:
-            raise DeviceGatewayError(
-                f"Device {self.device_id} has not initialized the requestId sequence."
-            )
+            raise DeviceGatewayError("Device has not initialized the requestId sequence.")
         current = self._next_request_id
         self._next_request_id += 1
         return current
@@ -269,8 +266,9 @@ class ConnectedDeviceSession:
         )
 
     @staticmethod
-    def _parse(raw: str) -> MessageEnvelope:
-        line = raw.strip()
+    def _parse(raw: str | bytes) -> MessageEnvelope:
+        line = raw if isinstance(raw, str) else bytes(raw).decode("utf-8")
+        line = line.strip()
         if not line:
             raise ProtocolViolation("Received empty JSONL message.")
         try:
@@ -286,58 +284,93 @@ class ConnectedDeviceSession:
 class DeviceGateway:
     def __init__(self, path_prefix: str = "/adb") -> None:
         self.path_prefix = path_prefix.rstrip("/")
-        self._devices: dict[str, ConnectedDeviceSession] = {}
+        self._session: ConnectedDeviceSession | None = None
         self._lock = asyncio.Lock()
 
-    def get_device(self, device_id: str) -> ConnectedDeviceSession:
-        session = self._devices.get(device_id)
-        if session is None or session.closed.is_set():
-            raise DeviceGatewayError(f"Device {device_id!r} is not connected.")
-        return session
-
-    def get_default_device(self) -> ConnectedDeviceSession:
-        for session in self._devices.values():
-            if not session.closed.is_set():
-                return session
+    def get_session(self) -> ConnectedDeviceSession:
+        session = self._session
+        if session is not None and not session.closed.is_set():
+            return session
         raise DeviceGatewayError("No connected device is available.")
 
-    async def wait_for_device(self, device_id: str, timeout: float = 15.0) -> ConnectedDeviceSession:
+    async def wait_for_session(self, timeout: float = 15.0) -> ConnectedDeviceSession:
         deadline = asyncio.get_running_loop().time() + timeout
         while True:
             try:
-                return self.get_device(device_id)
+                return self.get_session()
             except DeviceGatewayError:
                 if asyncio.get_running_loop().time() >= deadline:
                     raise
                 await asyncio.sleep(0.1)
 
     async def handler(self, websocket: ServerConnection) -> None:
-        device_id = self._extract_device_id(websocket.request.path)
-        session = ConnectedDeviceSession(websocket, device_id)
+        request = websocket.request
+        if request is None:
+            raise DeviceGatewayError("Missing websocket request metadata.")
+        self._validate_path(request.path)
+        session = ConnectedDeviceSession(websocket)
+
+        async with self._lock:
+            if self._session is not None and not self._session.closed.is_set():
+                raise DeviceGatewayError("Only one device connection is supported.")
+
         await session.start()
         await session.wait_ready()
         async with self._lock:
-            self._devices[device_id] = session
+            self._session = session
         try:
             await session.closed.wait()
         finally:
             async with self._lock:
-                if self._devices.get(device_id) is session:
-                    self._devices.pop(device_id, None)
+                if self._session is session:
+                    self._session = None
             await session.stop()
 
-    def _extract_device_id(self, path: str) -> str:
+    def _validate_path(self, path: str) -> None:
         normalized_path = path.split("?", 1)[0]
         if normalized_path == self.path_prefix:
-            return "default"
+            return
 
-        for legacy_prefix in ("/ws/devices/", "/ws/device/"):
-            if normalized_path.startswith(legacy_prefix):
-                device_id = normalized_path[len(legacy_prefix) :]
-                if not device_id:
-                    raise DeviceGatewayError("Missing deviceId in websocket path.")
-                return device_id
+        raise DeviceGatewayError(f"Invalid device path {path!r}. Expected {self.path_prefix!r}.")
 
-        raise DeviceGatewayError(
-            f"Invalid device path {path!r}. Expected {self.path_prefix!r} or a legacy device path."
-        )
+    async def starlette_handler(self, websocket: WebSocket) -> None:
+        await websocket.accept()
+        await self.handler(StarletteWebSocketConnection(websocket))
+
+
+class StarletteWebSocketConnection:
+    def __init__(self, websocket: WebSocket) -> None:
+        self.websocket = websocket
+        self.request = SimpleNamespace(path=websocket.url.path)
+        self.remote_address = websocket.client
+
+    async def send(self, message: str, *args: Any, **kwargs: Any) -> None:
+        await self.websocket.send_text(message)
+
+    async def close(self, code: int = 1000, reason: str | None = None) -> None:
+        await self.websocket.close(code=code, reason=reason)
+
+    def __aiter__(self) -> "StarletteWebSocketConnection":
+        return self
+
+    async def __anext__(self) -> str:
+        try:
+            return await self.websocket.receive_text()
+        except WebSocketDisconnect:
+            raise StopAsyncIteration from None
+
+
+def _sanitize_log_payload(payload: Any) -> Any:
+    if isinstance(payload, dict):
+        sanitized: dict[str, Any] = {}
+        for key, value in payload.items():
+            if key in {"screenshot", "ui"}:
+                sanitized[key] = "<omitted>"
+            else:
+                sanitized[key] = _sanitize_log_payload(value)
+        return sanitized
+
+    if isinstance(payload, list):
+        return [_sanitize_log_payload(item) for item in payload]
+
+    return payload

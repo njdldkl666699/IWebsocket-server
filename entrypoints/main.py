@@ -6,11 +6,12 @@ import re
 import ssl
 from contextlib import suppress
 
+from loguru import logger
 from websockets.asyncio.server import ServerConnection, serve
 from websockets.exceptions import ConnectionClosed
 
 clients: set[ServerConnection] = set()
-PATH_PATTERN = re.compile(r"^(?:/adb|/ws/devices/(?P<device_id>[^/]+)|/ws/device/(?P<legacy_device_id>[^/]+))$")
+PATH_PATTERN = re.compile(r"^/adb$")
 
 
 def _build_ssl_context(certfile: str | None, keyfile: str | None) -> ssl.SSLContext | None:
@@ -26,13 +27,13 @@ def _build_ssl_context(certfile: str | None, keyfile: str | None) -> ssl.SSLCont
 
 async def broadcast(message: str) -> None:
     if not clients:
-        print("[system] 当前没有已连接客户端")
+        logger.info("当前没有已连接客户端")
         return
 
     disconnected: list[ServerConnection] = []
     for ws in clients:
         try:
-            print("[broadcast] sending to client:", message)
+            logger.info(f"sending to client: {message}")
             await ws.send(message + "\n", text=True)
         except ConnectionClosed:
             disconnected.append(ws)
@@ -44,35 +45,34 @@ async def broadcast(message: str) -> None:
 async def handle_client(websocket: ServerConnection) -> None:
     request = websocket.request
     if request is None:
-        print("[reject] missing websocket request metadata")
+        logger.warning("missing websocket request metadata")
         await websocket.close(code=1008, reason="invalid request")
         return
 
     path = request.path
     match = PATH_PATTERN.match(path)
     if not match:
-        print(f"[reject] invalid device path: {path!r}")
+        logger.warning(f"invalid device path: {path!r}")
         await websocket.close(code=1008, reason="invalid path")
         return
 
-    device_id = match.group("device_id") or match.group("legacy_device_id") or "default"
     clients.add(websocket)
     peer = websocket.remote_address
-    print(f"[connect] device {device_id} connected: {peer}")
+    logger.info(f"device connected: {peer}")
 
     try:
         async for message in websocket:
-            print(f"[client {device_id}@{peer}] {message}")
+            logger.info(f"client @{peer}: {message}")
     except ConnectionClosed:
         pass
     finally:
         clients.discard(websocket)
-        print(f"[disconnect] device {device_id} disconnected: {peer}")
+        logger.info(f"device disconnected: {peer}")
 
 
 async def console_input_loop(stop_event: asyncio.Event) -> None:
-    print("[system] 输入一行 JSON envelope 并回车，可广播给所有客户端")
-    print("[system] 输入 /quit 关闭服务")
+    logger.info("输入一行 JSON envelope 并回车，可广播给所有客户端")
+    logger.info("输入 /quit 关闭服务")
 
     while not stop_event.is_set():
         text = await asyncio.to_thread(input, "server> ")
@@ -93,13 +93,13 @@ async def run_server(host: str, port: int, certfile: str | None, keyfile: str | 
     scheme = "wss" if ssl_context else "ws"
 
     async with serve(handle_client, host, port, ssl=ssl_context):
-        print(f"[system] websocket server listening at {scheme}://{host}:{port}/adb")
+        logger.info(f"websocket server listening at {scheme}://{host}:{port}/adb")
         input_task = asyncio.create_task(console_input_loop(stop_event))
 
         try:
             await stop_event.wait()
         except KeyboardInterrupt:
-            print("\n[system] received Ctrl+C, shutting down...")
+            logger.warning("received Ctrl+C, shutting down...")
         finally:
             input_task.cancel()
             with suppress(asyncio.CancelledError):
@@ -120,7 +120,7 @@ def main() -> None:
     try:
         asyncio.run(run_server(args.host, args.port, args.certfile, args.keyfile))
     except KeyboardInterrupt:
-        print("\n[system] server exited")
+        logger.warning("server exited")
 
 
 if __name__ == "__main__":
