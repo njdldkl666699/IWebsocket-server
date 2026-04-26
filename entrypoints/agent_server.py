@@ -27,7 +27,7 @@ InvokeResult: TypeAlias = dict[str, AgentMessages] | str | None
 
 
 async def agent_console_loop(
-    gateway: DeviceGateway,
+    phone_gateway: DeviceGateway,
     system_gateway: SystemToolGateway,
     stop_event: asyncio.Event,
 ) -> None:
@@ -35,7 +35,7 @@ async def agent_console_loop(
     logger.info("输入 /quit 关闭服务")
 
     conversation_messages: AgentMessages = []
-    agent = build_agent(gateway, system_gateway)
+    agent = build_agent(phone_gateway, system_gateway)
 
     while not stop_event.is_set():
         text = await asyncio.to_thread(input, "agent> ")
@@ -48,7 +48,7 @@ async def agent_console_loop(
             break
 
         try:
-            session = gateway.get_session()
+            session = phone_gateway.get_session()
         except DeviceGatewayError as exc:
             logger.warning(str(exc))
             continue
@@ -187,7 +187,7 @@ def _build_ssl_context(certfile: str | None, keyfile: str | None) -> ssl.SSLCont
 
 
 async def run_server(host: str, port: int, certfile: str | None, keyfile: str | None) -> None:
-    gateway = DeviceGateway()
+    phone_gateway = DeviceGateway()
     system_gateway = SystemToolGateway()
     stop_event = asyncio.Event()
     ssl_context = _build_ssl_context(certfile, keyfile)
@@ -199,13 +199,15 @@ async def run_server(host: str, port: int, certfile: str | None, keyfile: str | 
         if path == system_gateway.path:
             await system_gateway.handler(websocket)
             return
-        await gateway.handler(websocket)
+        await phone_gateway.handler(websocket)
 
     async with serve(websocket_handler, host, port, ssl=ssl_context):
         logger.info(f"websocket server listening at {scheme}://{host}:{port}/adb")
         logger.info(f"system tool websocket listening at {scheme}://{host}:{port}/system")
         logger.info("waiting for mobile client connections...")
-        input_task = asyncio.create_task(agent_console_loop(gateway, system_gateway, stop_event))
+        input_task = asyncio.create_task(
+            agent_console_loop(phone_gateway, system_gateway, stop_event)
+        )
 
         try:
             await stop_event.wait()

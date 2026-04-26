@@ -23,13 +23,9 @@ def _summarize_result(result: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _require_session(gateway: DeviceGateway):
-    return gateway.get_session()
-
-
 def create_phone_tools(gateway: DeviceGateway) -> list[Any]:
     async def send(message: str, data: Any) -> dict[str, Any]:
-        session = _require_session(gateway)
+        session = gateway.get_session()
         return await session.send_command(message, data)
 
     @tool("observe", description="Get the latest screenshot and UI tree from the phone.")

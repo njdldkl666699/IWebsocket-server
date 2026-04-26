@@ -6,8 +6,11 @@ from dataclasses import dataclass
 from typing import Any, Literal
 
 from pydantic import BaseModel, Field
+from starlette.websockets import WebSocket
 from websockets.asyncio.server import ServerConnection
 from websockets.exceptions import ConnectionClosed
+
+from .websocket_adapter import StarletteWebSocketConnection
 
 
 class SystemGatewayError(RuntimeError):
@@ -32,7 +35,11 @@ class SystemClientInfo:
 
 
 class ConnectedSystemClient:
-    def __init__(self, websocket: ServerConnection, path: str) -> None:
+    def __init__(
+        self,
+        websocket: ServerConnection | StarletteWebSocketConnection,
+        path: str,
+    ) -> None:
         self.websocket = websocket
         self.info = SystemClientInfo(path=path, remote_address=websocket.remote_address)
         self.closed = asyncio.Event()
@@ -94,7 +101,11 @@ class ConnectedSystemClient:
     async def _reader_loop(self) -> None:
         try:
             async for raw in self.websocket:
-                text = raw.decode("utf-8", errors="replace") if isinstance(raw, bytes) else raw
+                text = (
+                    raw
+                    if isinstance(raw, str)
+                    else bytes(raw).decode("utf-8", errors="replace")
+                )
                 for line in text.splitlines():
                     if not line.strip():
                         continue
@@ -159,7 +170,7 @@ class SystemToolGateway:
             raise SystemGatewayError("No connected system tool client is available.")
         return self._client
 
-    async def handler(self, websocket: ServerConnection) -> None:
+    async def handler(self, websocket: ServerConnection | StarletteWebSocketConnection) -> None:
         request = websocket.request
         path = request.path.split("?", 1)[0] if request is not None else ""
         if path != self.path:
@@ -180,3 +191,7 @@ class SystemToolGateway:
                 if self._client is client:
                     self._client = None
             await client.stop()
+
+    async def starlette_handler(self, websocket: WebSocket) -> None:
+        await websocket.accept()
+        await self.handler(StarletteWebSocketConnection(websocket))

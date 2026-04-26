@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 from .custom_deep_agent import build_agent
-from .runtime import gateway
+from .runtime import phone_gateway, system_gateway
 
-graph = build_agent(gateway)
+graph = build_agent(phone_gateway, system_gateway)
 
-__all__ = ["gateway", "graph"]
+__all__ = ["graph"]

@@ -5,12 +5,12 @@ from collections.abc import Sequence
 from typing import TypeAlias, cast
 
 from deepagents import create_deep_agent
+from dotenv import load_dotenv
 from langchain.agents.middleware.types import AgentState, StateT, before_model
 from langchain_core.messages import BaseMessage, HumanMessage, RemoveMessage
 from langchain_openai import ChatOpenAI
 from langgraph.graph.message import REMOVE_ALL_MESSAGES
 from langgraph.runtime import Runtime
-from dotenv import load_dotenv
 from pydantic import SecretStr
 
 from .phone_gateway import ConnectedDeviceSession, DeviceGateway
@@ -164,14 +164,14 @@ def remove_old_images(
     }
 
 
-def make_sync_phone_state_middleware(gateway: DeviceGateway):
+def make_sync_phone_state_middleware(phone_gateway: DeviceGateway):
     @before_model
     def sync_phone_state(
         state: AgentState[StateT],
         runtime: Runtime,
     ) -> MiddlewarePatch | None:
         try:
-            session = gateway.get_session()
+            session = phone_gateway.get_session()
         except Exception:
             return None
 
@@ -190,19 +190,18 @@ def make_sync_phone_state_middleware(gateway: DeviceGateway):
     return sync_phone_state
 
 
-def build_agent(gateway: DeviceGateway, system_gateway: SystemToolGateway | None = None):
+def build_agent(phone_gateway: DeviceGateway, system_gateway: SystemToolGateway):
     model = _build_model()
-    tools = list(create_phone_tools(gateway))
-    prompts = [SYSTEM_PROMPT, TOOL_PROMPT]
-    if system_gateway is not None:
-        tools.extend(create_system_tools(system_gateway))
-        prompts.append(SYSTEM_TOOL_PROMPT)
+    tools = [
+        *create_phone_tools(phone_gateway),
+        *create_system_tools(system_gateway),
+    ]
 
     return create_deep_agent(
         model=model,
         tools=tools,
-        system_prompt="\n\n".join(prompts),
-        middleware=[remove_old_images, make_sync_phone_state_middleware(gateway)],
+        system_prompt="\n\n".join([SYSTEM_PROMPT, TOOL_PROMPT, SYSTEM_TOOL_PROMPT]),
+        middleware=[remove_old_images, make_sync_phone_state_middleware(phone_gateway)],
     )
 
 
@@ -217,7 +216,7 @@ def _build_model():
             api_key=SecretStr(openai_key),
             base_url=openai_base_url,
             model=openai_model,
-            max_tokens=openai_max_tokens,
+            max_tokens=openai_max_tokens,  # type: ignore
         )
 
     return "openai:gpt-5.4"

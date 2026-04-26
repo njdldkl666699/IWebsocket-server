@@ -4,14 +4,15 @@ import asyncio
 import json
 import os
 from dataclasses import dataclass
-from types import SimpleNamespace
 from typing import Any, Literal
 
 from loguru import logger
-from starlette.websockets import WebSocket, WebSocketDisconnect
 from pydantic import BaseModel, Field
+from starlette.websockets import WebSocket
 from websockets.asyncio.server import ServerConnection
 from websockets.exceptions import ConnectionClosed
+
+from .websocket_adapter import StarletteWebSocketConnection
 
 VERBOSE_HEARTBEAT = os.getenv("VERBOSE_HEARTBEAT", "").lower() in {"1", "true", "yes"}
 
@@ -41,13 +42,6 @@ class ConnectData(BaseModel):
     token: str | None = None
 
 
-class ActionResultData(BaseModel):
-    screenshot: str | None = None
-    ui: str | None = None
-    currentPackage: str | None = None
-    activity: str | None = None
-
-
 class ErrorData(BaseModel):
     message: str
     screenshot: str | None = None
@@ -68,7 +62,7 @@ class DeviceInfo:
 
 
 class ConnectedDeviceSession:
-    def __init__(self, websocket: ServerConnection | "StarletteWebSocketConnection") -> None:
+    def __init__(self, websocket: ServerConnection | StarletteWebSocketConnection) -> None:
         self.websocket = websocket
         self.device_info: DeviceInfo | None = None
         self.ready = asyncio.Event()
@@ -293,17 +287,7 @@ class DeviceGateway:
             return session
         raise DeviceGatewayError("No connected device is available.")
 
-    async def wait_for_session(self, timeout: float = 15.0) -> ConnectedDeviceSession:
-        deadline = asyncio.get_running_loop().time() + timeout
-        while True:
-            try:
-                return self.get_session()
-            except DeviceGatewayError:
-                if asyncio.get_running_loop().time() >= deadline:
-                    raise
-                await asyncio.sleep(0.1)
-
-    async def handler(self, websocket: ServerConnection) -> None:
+    async def handler(self, websocket: ServerConnection | StarletteWebSocketConnection) -> None:
         request = websocket.request
         if request is None:
             raise DeviceGatewayError("Missing websocket request metadata.")
@@ -336,28 +320,6 @@ class DeviceGateway:
     async def starlette_handler(self, websocket: WebSocket) -> None:
         await websocket.accept()
         await self.handler(StarletteWebSocketConnection(websocket))
-
-
-class StarletteWebSocketConnection:
-    def __init__(self, websocket: WebSocket) -> None:
-        self.websocket = websocket
-        self.request = SimpleNamespace(path=websocket.url.path)
-        self.remote_address = websocket.client
-
-    async def send(self, message: str, *args: Any, **kwargs: Any) -> None:
-        await self.websocket.send_text(message)
-
-    async def close(self, code: int = 1000, reason: str | None = None) -> None:
-        await self.websocket.close(code=code, reason=reason)
-
-    def __aiter__(self) -> "StarletteWebSocketConnection":
-        return self
-
-    async def __anext__(self) -> str:
-        try:
-            return await self.websocket.receive_text()
-        except WebSocketDisconnect:
-            raise StopAsyncIteration from None
 
 
 def _sanitize_log_payload(payload: Any) -> Any:

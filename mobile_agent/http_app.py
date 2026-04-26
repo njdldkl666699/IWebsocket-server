@@ -1,4 +1,4 @@
-"""Custom LangGraph HTTP app routes for the mobile device websocket."""
+"""Custom LangGraph HTTP app routes for mobile and system tool websockets."""
 
 from __future__ import annotations
 
@@ -8,17 +8,23 @@ from starlette.responses import JSONResponse
 from starlette.routing import Route, WebSocketRoute
 from starlette.websockets import WebSocket
 
-from .runtime import gateway
+from .phone_gateway import DeviceGatewayError
+from .runtime import phone_gateway, system_gateway
+from .system_gateway import SystemGatewayError
 
 
 async def adb_websocket(websocket: WebSocket) -> None:
-    await gateway.starlette_handler(websocket)
+    await phone_gateway.starlette_handler(websocket)
+
+
+async def system_websocket(websocket: WebSocket) -> None:
+    await system_gateway.starlette_handler(websocket)
 
 
 async def adb_status(request: Request) -> JSONResponse:
     try:
-        session = gateway.get_session()
-    except Exception:
+        session = phone_gateway.get_session()
+    except DeviceGatewayError:
         return JSONResponse({"connected": False})
 
     device_info = session.device_info
@@ -33,9 +39,26 @@ async def adb_status(request: Request) -> JSONResponse:
     )
 
 
+async def system_status(request: Request) -> JSONResponse:
+    try:
+        client = system_gateway.get_default_client()
+    except SystemGatewayError:
+        return JSONResponse({"connected": False})
+
+    return JSONResponse(
+        {
+            "connected": True,
+            "path": client.info.path,
+            "remoteAddress": str(client.info.remote_address),
+        }
+    )
+
+
 app = Starlette(
     routes=[
         WebSocketRoute("/adb", adb_websocket),
+        WebSocketRoute("/system", system_websocket),
         Route("/adb/status", adb_status, methods=["GET"]),
+        Route("/system/status", system_status, methods=["GET"]),
     ]
 )

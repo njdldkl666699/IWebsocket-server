@@ -4,20 +4,22 @@
 
 这个项目是一个 Android 手机远程操作服务端。
 
-它通过 WebSocket 与手机侧工具通信（协议见 `ADB工具协议.md`），并在服务端把手机能力包装成工具（observe、tap、swipe、type、keyevent 等），供 Deep Agent 进行任务规划和自动执行。
+它通过 WebSocket 与手机侧工具通信，并在服务端把手机能力包装成工具（observe、tap、swipe、type、keyevent 等），供 Deep Agent 进行任务规划和自动执行。
 
 当前代码已按单设备模型实现：
 
-- WebSocket 路径固定为 `/adb`
+- 手机操作 WebSocket 路径固定为 `/adb`
+- 系统工具 WebSocket 路径固定为 `/system`
 - 同一时刻只允许 1 台设备连接
 - Agent 每轮可基于最新截图和 UI 树决策
 
 ## 核心流程
 
-1. 手机客户端连接 `ws://host:port/adb`，首条消息发送 `connect`。
-2. 服务端保存设备会话状态（分辨率、截图、UI、当前包名、Activity）。
-3. Agent 调用工具，工具通过 WebSocket 下发请求到手机端。
-4. 手机端返回 `actionResult` 或 `error`，服务端更新状态并继续下一步。
+1. 使用 `langgraph dev` 启动 LangGraph API Server。
+2. 手机操作客户端连接 `ws://host:port/adb`，首条消息发送 `connect`。
+3. 系统工具客户端连接 `ws://host:port/system`，提供应用列表、日程、提醒、定位等 API。
+4. LangGraph API 调用 `agent` graph，Agent 通过工具向两个 WebSocket client 下发请求。
+5. 手机端或系统工具端返回结果，服务端更新状态并继续下一步。
 
 ## 开发环境要求
 
@@ -57,15 +59,29 @@ pip install -e .
 pip install mypy ruff pytest "langgraph-cli[inmem]" anyio
 ```
 
-## 三个 entrypoint 的作用
+## 正式运行：LangGraph API
 
-### LangGraph / LangSmith 调试
+项目的正式入口是 `langgraph dev`。它会读取 `langgraph.json`，同时启动：
 
-`langgraph.json` 暴露 `agent` graph 给 LangGraph Server / Studio 使用：
+- LangGraph API / Studio 调试服务
+- `agent` graph
+- 自定义 HTTP app 中的 `/adb` 和 `/system` WebSocket 路由
+- `/adb/status` 和 `/system/status` 状态检查接口
 
 ```bash
 langgraph dev --port 2024
 ```
+
+启动后：
+
+- LangGraph API: `http://127.0.0.1:2024`
+- Studio UI: 终端输出的 `https://smith.langchain.com/studio/?baseUrl=...`
+- 手机操作客户端连接：`ws://127.0.0.1:2024/adb`
+- 系统工具客户端连接：`ws://127.0.0.1:2024/system`
+- 手机连接状态：`http://127.0.0.1:2024/adb/status`
+- 系统工具连接状态：`http://127.0.0.1:2024/system/status`
+
+LangSmith tracing 使用 `.env` 中的 `LANGSMITH_TRACING=true`、`LANGSMITH_PROJECT` 和 `LANGSMITH_API_KEY`。
 
 如果看到 Windows 的 `WinError 10048`，表示端口已经被另一个进程占用。可以换端口：
 
@@ -79,7 +95,7 @@ langgraph dev --port 2025
 Get-NetTCPConnection -LocalPort 2024 | Select-Object LocalAddress,LocalPort,State,OwningProcess
 ```
 
-LangSmith tracing 使用 `.env` 中的 `LANGSMITH_TRACING=true`、`LANGSMITH_PROJECT` 和 `LANGSMITH_API_KEY`。
+## 调试 entrypoint
 
 ### 1) `entrypoints.main`
 
@@ -97,7 +113,7 @@ python -m entrypoints.main --host 127.0.0.1 --port 8765
 
 ### 2) `entrypoints.agent_server`
 
-正式的 Agent 控制入口。
+旧的终端 Agent 控制入口，适合不用 LangGraph API 时手工调试。
 
 - 启动 `DeviceGateway` 并接收手机连接
 - 构建 Deep Agent 与手机工具集
@@ -125,10 +141,10 @@ python -m entrypoints.mock_portal_client
 
 ## 快速联调示例
 
-1. 终端 A 启动 Agent 服务：
+1. 终端 A 启动 LangGraph API：
 
 ```bash
-python -m entrypoints.agent_server
+langgraph dev --port 8765
 ```
 
 2. 终端 B 启动模拟手机端：
@@ -137,7 +153,7 @@ python -m entrypoints.agent_server
 python -m entrypoints.mock_portal_client
 ```
 
-3. 回到终端 A 输入任务，例如：
+3. 打开 Studio UI，选择 `agent`，在同一个 thread 中输入任务，例如：
 
 ```text
 打开系统设置，然后返回桌面
